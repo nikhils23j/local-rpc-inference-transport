@@ -1,0 +1,62 @@
+{
+  "environment": "macOS localhost; synthetic checksum service, not real inference",
+  "cases": [
+    {
+      "count": 10000,
+      "payload_bytes": 1024,
+      "concurrency": 32,
+      "ok": 10000,
+      "rejected": 0,
+      "deadline": 0,
+      "data_loss": 0,
+      "errors": 0,
+      "seconds": 6.44772,
+      "requests_per_second": 1550.94,
+      "p50_us": 20197,
+      "p95_us": 21055,
+      "name": "single_worker",
+      "workers": 1,
+      "capacity": 10000,
+      "work_us": 500,
+      "peak_server_rss_kib": 19856
+    },
+    {
+      "count": 10000,
+      "payload_bytes": 1024,
+      "concurrency": 32,
+      "ok": 10000,
+      "rejected": 0,
+      "deadline": 0,
+      "data_loss": 0,
+      "errors": 0,
+      "seconds": 1.58213,
+      "requests_per_second": 6320.59,
+      "p50_us": 5047,
+      "p95_us": 5179,
+      "name": "bounded_four_workers",
+      "workers": 4,
+      "capacity": 64,
+      "work_us": 500,
+      "peak_server_rss_kib": 20096
+    },
+    {
+      "count": 1000,
+      "payload_bytes": 65536,
+      "concurrency": 128,
+      "ok": 40,
+      "rejected": 960,
+      "deadline": 0,
+      "data_loss": 0,
+      "errors": 0,
+      "seconds": 0.107938,
+      "requests_per_second": 370.582,
+      "p50_us": 32156,
+      "p95_us": 48865,
+      "name": "overload",
+      "workers": 2,
+      "capacity": 8,
+      "work_us": 3000,
+      "peak_server_rss_kib": 50608
+    }
+  ]
+}

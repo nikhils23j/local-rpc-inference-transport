@@ -1,0 +1,19 @@
+syntax = "proto3";
+package transport;
+
+service InferenceTransport {
+  rpc Send(InferenceRequest) returns (InferenceReply);
+}
+
+message InferenceRequest {
+  uint64 id = 1;
+  bytes payload = 2;
+  uint64 expected_checksum = 3;
+}
+
+message InferenceReply {
+  uint64 id = 1;
+  uint64 checksum = 2;
+  uint64 queue_us = 3;
+  uint64 service_us = 4;
+}
