@@ -327,7 +327,6 @@ local-rpc-inference-transport/
 ├── scripts/make_figures.py results.json → docs/img/*.png
 ├── docs/img/               README charts
 ├── results.json            recorded evaluation
-├── INTERVIEW_NOTES.md
 └── LICENSE
 ```
 
@@ -346,11 +345,3 @@ local-rpc-inference-transport/
 - Three runs per cell is enough to see the spread, not enough for tight confidence
   intervals.
 - There's no TLS or auth, and the server binds only to 127.0.0.1.
-
-## More
-
-How it works in more depth, why I made each choice, and the questions I expect
-in an interview are in [INTERVIEW_NOTES.md](INTERVIEW_NOTES.md).
-
-I built this as a personal project with AI pair-programming help. I can walk
-through any line of it.
