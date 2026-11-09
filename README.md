@@ -2,6 +2,23 @@
 
 *A tiny LLM-serving front end in C++20 + gRPC, with fake compute and real queueing.*
 
+## TL;DR
+
+All numbers are medians of 3 runs on one M2 laptop, rounded to whole numbers,
+from [`results.json`](results.json).
+
+- **Continuous batching kept time-to-first-token low.** At 200 requests/s,
+  static and continuous batching both delivered 197/s of goodput, but TTFT p99
+  was 265 ms for static and 28 ms for continuous.
+- **No batching and no admission control collapses.** Goodput *fell* from 26/s
+  (at 25/s offered) to 7/s (at 300/s offered), because almost every request
+  waited most of its deadline and then died.
+- **Saying no early beat letting requests time out.** At 300/s offered,
+  deadline-aware admission (slack 0.8) delivered 267/s with 0 timeouts;
+  accepting everything delivered 218/s with 317 timeouts and 6,958 wasted tokens.
+- **Workers scaled once the queue policy was held fixed.** With tail-drop 64 at
+  400/s offered: 130/s with 1 worker, 240/s with 2, 394/s with 4 (and 0 rejects).
+
 I wondered why ChatGPT still feels fast when lots of people are using it. Some of
 the answer is bigger GPUs, but a lot of it turned out to be **scheduling**:
 how requests get batched, which ones go first, and which ones you turn away early
@@ -13,24 +30,31 @@ depends on the batch size. Everything around it is real: gRPC streaming,
 protobuf, deadlines, cancellation, the batching scheduler, admission control, and
 an open-loop load generator.
 
-## How it works
+```mermaid
+flowchart LR
+    CL["load generator<br/>open-loop Poisson arrivals<br/>512 threads, 4 HTTP/2 channels"]
+    subgraph SRV["gRPC server on 127.0.0.1"]
+        CK{"prompt checksum OK?"}
+        AD{"admission policy<br/>unbounded / taildrop /<br/>deadline / adaptive"}
+        Q["waiting queue<br/>interactive lane + batch lane"]
+        W1["worker 1<br/>running batch"]
+        WN["worker N<br/>running batch"]
+    end
+    DL["DATA_LOSS"]
+    RE["RESOURCE_EXHAUSTED"]
+    CL -- "Generate(prompt, checksum,<br/>max_tokens, priority) + deadline" --> CK
+    CK -- "no" --> DL
+    CK -- "yes" --> AD
+    AD -- "reject" --> RE
+    AD -- "admit" --> Q
+    Q --> W1
+    Q --> WN
+    TS["token stream back to the client<br/>one TokenChunk per step"]
+    W1 --> TS
+    WN --> TS
+```
 
-```
- client (open-loop Poisson arrivals, 512 threads, 4 HTTP/2 connections)
-   │  Generate(prompt, checksum, max_tokens, priority)  + gRPC deadline
-   ▼
- ┌──────────────── gRPC server (127.0.0.1) ────────────────┐
- │ 1. verify prompt checksum ──────────────► DATA_LOSS     │
- │ 2. admission policy ────────────────────► RESOURCE_     │
- │    unbounded | taildrop | deadline-aware | AIMD   EXHAUSTED
- │ 3. waiting queue: [interactive lane] [batch lane]       │
- │ 4. N replica workers, each running a batch:             │
- │      step cost = fixed + per_seq*batch + prefill*new    │
- │      each step emits 1 token per sequence ──► stream    │
- │      cancelled/expired sequences leave at step boundary │
- └─────────────────────────────────────────────────────────┘
-   ▲  stream TokenChunk{index, token, batch_size, queue_us}
-```
+## What I built
 
 - **Streaming tokens.** `Generate` is a server-streaming RPC. That gives
   time-to-first-token (TTFT) as its own measurement, separate from total latency.
@@ -67,27 +91,50 @@ an open-loop load generator.
   down when the server does. Latency is measured from the *scheduled* send time,
   which avoids coordinated omission.
 
+## How it works
+
+The engine (`src/engine.cpp`) has no gRPC in it. N "replica" workers share one
+waiting queue, and each worker runs a loop of scheduler *steps*. This is the
+lifecycle of one request under continuous batching:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant H as gRPC handler
+    participant AD as Admission
+    participant Q as Two-lane queue
+    participant W as Worker
+    C->>H: Generate(prompt, checksum, max_tokens, priority) with a 1 s deadline
+    H->>H: verify FNV-1a prompt checksum
+    H->>AD: admit this request?
+    alt rejected (queue full, would miss deadline, or over the AIMD limit)
+        AD-->>H: no
+        H-->>C: RESOURCE_EXHAUSTED, right away
+    else admitted
+        AD->>Q: enqueue (interactive lane is served first)
+        loop every scheduler step
+            W->>W: drop sequences that were cancelled or are past their deadline
+            W->>Q: pull new sequences into the running batch, up to max batch
+            W->>W: sleep for fixed + per_seq x batch + prefill x new µs
+            W-->>H: one token for every sequence in the batch
+            H-->>C: TokenChunk (index, token, batch_size, queue_us)
+        end
+        H-->>C: stream ends OK after max_tokens, or the client sees DEADLINE_EXCEEDED
+    end
+```
+
+In `static` mode the "pull new sequences" step only happens when the batch is
+empty (after waiting up to `max_wait` for it to fill), so a new request waits for
+the whole previous batch to finish. In `none` mode the batch size is 1. That
+single difference is what the first chart below is about.
+
 Code layout:
 - `src/admission.hpp` has the queue, the cost model, the predictor and AIMD. It is
   pure logic.
 - `src/engine.{hpp,cpp}` has the scheduler and workers, with no gRPC.
 - `src/main.cpp` has the gRPC server and the load generator.
-- `tests/unit_tests.cpp` has 11 engine and admission tests.
-- `tests/smoke.sh` is an end-to-end gRPC test.
 
-## Build, test, run
-
-Needs CMake ≥ 3.20, a C++20 compiler, and gRPC + protobuf with CMake config files.
-On macOS that's `brew install cmake protobuf grpc`.
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j8
-ctest --test-dir build --output-on-failure      # unit + integration
-python3 evaluate.py build/transport              # full matrix, ~9 min, writes results.json
-```
-
-## What we measured
+## Results
 
 Setup: one Apple M2 laptop (8 cores, 8 GB), macOS 27.2, AppleClang 21, gRPC
 1.85.1, protobuf 36.2. Client and server ran on the same machine. Each cell
@@ -99,7 +146,8 @@ and has a 4 s arrival window. Unless a table says otherwise:
 
 "Goodput" means requests that got *all* their tokens before the deadline, per
 second. Everything comes from `results.json` and was produced by
-`python3 evaluate.py build/transport --reps 3` (533 s wall time).
+`python3 evaluate.py build/transport --reps 3` (533 s wall time). The charts are
+drawn from `results.json` only, by [`scripts/make_figures.py`](scripts/make_figures.py).
 
 This laptop was shared with other heavy jobs. I threw out my first attempts,
 which ran at load averages of about 100–200. Steps took up to ~1.8× the cost model
@@ -111,6 +159,8 @@ are recorded per run in `results.json`.
 
 ### 1. Batching mode (same 2 workers, no admission control)
 
+![Two panels against offered load from 25 to 300 requests per second. Left: goodput; static and continuous track the offered load up to 200/s, static drops to 141/s at 300/s, continuous reaches 240/s, and no-batching collapses to under 30/s. Right: TTFT p99 on a log scale; continuous stays near 10 to 28 ms up to 200/s, static is 73 to 265 ms, no-batching sits near the 1 s deadline.](docs/img/batching_modes.png)
+
 | offered | none: goodput / TTFT p99 | static: goodput / TTFT p99 | continuous: goodput / TTFT p99 |
 |---:|---|---|---|
 | 25/s | 26/s · 258 ms [175–320] | 26/s · 73 ms [69–78] | 26/s · **10 ms** [9–10] |
@@ -119,9 +169,12 @@ are recorded per run in `results.json`.
 | 300/s | 7/s [7–7] · 882 ms | 141/s [137–147] · 932 ms | **240/s** [235–246] · 910 ms |
 
 At 200/s, continuous batching's p99 *total* latency was 206 ms [205–210] vs
-408 ms [376–462] for static.
+408 ms [376–462] for static. (The chart also shows the 50/s runs, which the
+table skips.)
 
 ### 2. Admission policy under overload (300/s offered, ~1,200 requests, same 2 workers, continuous)
+
+![Three panels, one row per admission policy at 300 requests per second offered. Left: goodput, highest for deadline-aware with slack 0.8 at 267/s. Middle: requests rejected up front vs timed out after admission; unbounded and tail-drop 256 time out hundreds, tail-drop 64, slack 0.8 and AIMD time out none. Right: p99 latency, lowest for AIMD at 291 ms, near the 1000 ms deadline for unbounded, tail-drop 256 and deadline-aware slack 1.0.](docs/img/admission_policies.png)
 
 | policy | goodput | p99 latency | rejected up front | timed out after admission | tokens wasted |
 |---|---:|---:|---:|---:|---:|
@@ -144,6 +197,8 @@ goodput, p99 180–200 ms, zero rejects.
 
 ### 4. Worker count, with the queue policy held fixed (tail-drop 64, 400/s offered)
 
+![Three bar panels for 1, 2 and 4 workers at 400 requests per second offered with tail-drop 64. Goodput rises from 130/s to 240/s to 394.5/s, rejects fall from 1,062 to 598 to 0, and p99 latency falls from 815 ms to 520 ms to 207 ms.](docs/img/workers_scaling.png)
+
 | workers | goodput | p99 | rejected |
 |---:|---:|---:|---:|
 | 1 | 130/s [129–130] | 815 ms | 1,062 of ~1,578 |
@@ -154,7 +209,7 @@ The old version of this project compared 1 worker with an unbounded queue agains
 4 workers with a bounded one, so it mixed up two effects. Here only one thing
 changes per table.
 
-## What surprised us
+### What surprised us
 
 - **No admission control doesn't just get slow, it collapses.** With batch size 1,
   the server tops out around 25 requests/s (that's what it served at 50/s offered).
@@ -181,12 +236,40 @@ changes per table.
   deadline predictor can't see interactive requests that will later jump ahead in
   the queue.
 
-## Break it yourself
+### What the numbers do NOT show
+
+- **Real model throughput.** The "compute" is a sleep following a cost model I
+  made up, so the absolute req/s say nothing about vLLM, TGI or any GPU.
+- **Tight confidence intervals.** Three runs per cell shows the spread, nothing
+  more. Some whiskers are wide (e.g. unbounded timeouts at 300/s: 276–463).
+- **Network effects.** Client and server share one laptop over localhost.
+- **A tuned slack value.** Slack 0.8 was picked from one exploratory run on this
+  one workload.
+- **Behaviour at thousands of streams.** The sync gRPC server uses a thread per
+  in-flight stream; I only went up to a few hundred.
+
+## Run it yourself
+
+**Prerequisites:** CMake ≥ 3.20, a C++20 compiler, and gRPC + protobuf with CMake
+config files. On macOS that's `brew install cmake protobuf grpc`. Python 3 for the
+evaluation (standard library only), plus matplotlib if you want to redraw the
+charts.
+
+**Setup and build:**
+
+```sh
+git clone https://github.com/nikhils23j/local-rpc-inference-transport.git
+cd local-rpc-inference-transport
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j8
+```
+
+**Quickstart** ("break it yourself"):
 
 ```sh
 # terminal 1: one worker, no batching, no admission control
 ./build/transport server --port 50051 --workers 1 --mode none --policy unbounded
-# terminal 2: offer 3x what it can do and watch goodput collapse
+# terminal 2: offer 3x what it can do and watch goodput collapse (4 s arrival window)
 ./build/transport client --port 50051 --rate 100 --duration-s 4 | python3 -m json.tool
 ```
 
@@ -202,7 +285,53 @@ The client prints JSON with overall, per-class, and server-side counters. These
 include wasted tokens, the mean batch size, the predictor's accuracy, and the
 final AIMD limit.
 
-## What this isn't
+**Full evaluation** (32 configurations × 3 runs, fresh server per run):
+
+```sh
+python3 evaluate.py build/transport --reps 3    # ~9 min (533 s recorded), writes results.json
+python3 evaluate.py build/transport --quick     # smaller matrix for a sanity check
+python3 scripts/make_figures.py                 # redraw docs/img/*.png from results.json
+```
+
+On a busy machine it can take longer, because `evaluate.py` waits (up to 60 s per
+run, 240 s total) for the 1-minute load average to drop below 12.
+
+## Tests
+
+```sh
+ctest --test-dir build --output-on-failure
+```
+
+Both tests take about 5 s total on my M2 (almost all of it the integration test).
+
+| test | what it covers |
+|---|---|
+| `unit` (`tests/unit_tests.cpp`, no gRPC) | 11 engine and admission tests: AIMD limit updates, the two-class queue, the finish-time predictor, continuous batching respecting max batch, continuous vs static joining, cancelling a running sequence, tail-drop vs unbounded, expiring requests while queued, deadline-aware admission, adaptive-limit admission, and interactive requests served first |
+| `integration` (`tests/smoke.sh`) | a real gRPC server and client over localhost: 200/200 requests complete with every token verified; a corrupted checksum gives 5/5 `DATA_LOSS`; overload with a tiny tail-drop queue rejects requests and accounts for every one; deadline-aware admission rejects early instead of timing out |
+
+## Project layout
+
+```
+local-rpc-inference-transport/
+├── CMakeLists.txt          engine library, unit tests, protoc codegen, transport binary
+├── proto/inference.proto   Generate (server-streaming) and Stats RPCs
+├── src/
+│   ├── admission.hpp       queue, cost model, predictor, AIMD (pure logic)
+│   ├── engine.hpp/.cpp     scheduler + workers, no gRPC
+│   ├── common.hpp          shared helpers
+│   └── main.cpp            gRPC server and open-loop load generator
+├── tests/
+│   ├── unit_tests.cpp      11 engine/admission tests
+│   └── smoke.sh            end-to-end gRPC test
+├── evaluate.py             experiment matrix → results.json
+├── scripts/make_figures.py results.json → docs/img/*.png
+├── docs/img/               README charts
+├── results.json            recorded evaluation
+├── INTERVIEW_NOTES.md
+└── LICENSE
+```
+
+## What this isn't / limits
 
 - It's not inference. No model, no tokenizer, no GPU, no KV cache, no memory
   pressure. Compute is a sleep plus a short spin, following a cost model I made up.
@@ -217,6 +346,11 @@ final AIMD limit.
 - Three runs per cell is enough to see the spread, not enough for tight confidence
   intervals.
 - There's no TLS or auth, and the server binds only to 127.0.0.1.
+
+## More
+
+How it works in more depth, why I made each choice, and the questions I expect
+in an interview are in [INTERVIEW_NOTES.md](INTERVIEW_NOTES.md).
 
 I built this as a personal project with AI pair-programming help. I can walk
 through any line of it.
