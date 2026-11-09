@@ -1,19 +1,53 @@
 syntax = "proto3";
 package transport;
 
+// A tiny LLM-serving-shaped front end. There is no model: the server "generates"
+// deterministic pseudo-tokens and spends synthetic time per scheduler step.
 service InferenceTransport {
-  rpc Send(InferenceRequest) returns (InferenceReply);
+  // Stream tokens back one chunk per scheduler step.
+  rpc Generate(GenerateRequest) returns (stream TokenChunk);
+  // Server-side counters (admission, batching, wasted work).
+  rpc Stats(StatsRequest) returns (ServerStats);
 }
 
-message InferenceRequest {
-  uint64 id = 1;
-  bytes payload = 2;
-  uint64 expected_checksum = 3;
+enum Priority {
+  INTERACTIVE = 0;
+  BATCH = 1;
 }
 
-message InferenceReply {
+message GenerateRequest {
   uint64 id = 1;
-  uint64 checksum = 2;
-  uint64 queue_us = 3;
-  uint64 service_us = 4;
+  bytes prompt = 2;              // synthetic prompt bytes
+  uint64 expected_checksum = 3;  // FNV-1a of prompt; mismatch -> DATA_LOSS
+  uint32 max_tokens = 4;         // 1..1024
+  Priority priority = 5;
+}
+
+message TokenChunk {
+  uint32 index = 1;       // 0-based token index
+  uint64 token = 2;       // mix(prompt checksum, index); client re-derives it
+  uint32 batch_size = 3;  // batch size of the step that produced this token
+  uint64 queue_us = 4;    // time spent waiting before the first step (index 0 only)
+}
+
+message StatsRequest {}
+
+message ServerStats {
+  uint64 admitted = 1;
+  uint64 rejected_queue_full = 2;
+  uint64 rejected_deadline = 3;
+  uint64 rejected_limit = 4;
+  uint64 completed = 5;
+  uint64 expired_in_queue = 6;
+  uint64 dropped_active = 7;      // cancelled/expired after starting
+  uint64 tokens_generated = 8;
+  uint64 tokens_wasted = 9;       // tokens produced for requests that did not complete
+  uint64 steps = 10;
+  double mean_batch = 11;
+  double mean_step_us = 12;
+  uint64 peak_waiting = 13;
+  double adaptive_limit = 14;
+  // Deadline-aware predictor, over admitted requests that completed:
+  double predictor_mean_ratio = 15;          // mean(actual / predicted service time)
+  double predictor_underestimate_frac = 16;  // fraction where actual > predicted
 }
